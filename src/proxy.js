@@ -281,18 +281,31 @@ export function createProxy(config, deps = {}) {
   async function relay(res, upstream, { resumable, trail }) {
     if (!resumable) {
       const sniff = usageSniffer(upstream.headers.get('content-type'));
-      await pipeUpstream(res, upstream, (c) => sniff.push(c));
-      sniff.finish();
+      try {
+        await untilClientLeaves(pipeUpstream(res, upstream, (c) => sniff.push(c)));
+      } finally {
+        sniff.finish();
+      }
       return sniff.usage;
     }
-    await pipeWithContinuation(res, upstream, {
+    await untilClientLeaves(pipeWithContinuation(res, upstream, {
       onEvent: (event) => {
         trail.usage = event.response?.usage ?? trail.usage;
       },
       onCompleted: (data) => resumeTurn(trail, data),
       onError: (err) => process.stderr.write(`jev: resume failed: ${err.message}\n`),
-    });
+    }));
     return trail.usage;
+  }
+
+  // Codex closes the connection as soon as it has response.completed, which aborts the
+  // upstream read; the generation still finished, so it is logged like any other.
+  async function untilClientLeaves(piping) {
+    try {
+      await piping;
+    } catch (err) {
+      if (err.name !== 'AbortError') throw err;
+    }
   }
 
   // Stats and the decision log of a routed request, once its answer has been relayed.
