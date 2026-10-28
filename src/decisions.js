@@ -4,6 +4,7 @@
 const MAX_STEPS = 12;
 const MAX_CMD = 200;
 const MAX_TASK = 2000;
+const MAX_FINAL = 2000;
 
 const EFFORT_CRITERIA = {
   minimal: 'Trivial: a greeting or a purely mechanical next step.',
@@ -75,24 +76,59 @@ export function toAssessment(answers, ladder, minConfidence) {
   };
 }
 
-/**
- * @param {{url:string, apiKey:string, model:string, timeoutMs:number, ladder:string[],
- *          minConfidence:number, sessionId?:string, currentEffort?:string}} opts
- * @returns {Promise<{target:number, hold:number, release:boolean, stuck:number, reasons:string[], cost:number|null}>}
- */
-export async function jevDecide(turn, opts) {
+/** POSTs one Decisions request; resolves to the parsed body or throws on HTTP error. */
+async function postDecision(opts, state, questions) {
   const res = await fetch(opts.url, {
     method: 'POST',
     headers: { authorization: `Bearer ${opts.apiKey}`, 'content-type': 'application/json' },
     body: JSON.stringify({
       model: opts.model,
-      state: buildState(turn, opts.currentEffort),
-      questions: buildQuestions(opts.ladder),
+      state,
+      questions,
       ...(opts.sessionId ? { session_id: opts.sessionId.slice(0, 256) } : {}),
     }),
     signal: AbortSignal.timeout(opts.timeoutMs),
   });
   const body = await res.json().catch(() => null);
   if (!res.ok) throw new Error(`Jev HTTP ${res.status}: ${body?.error?.message ?? 'no error body'}`);
+  return body;
+}
+
+/**
+ * @param {{url:string, apiKey:string, model:string, timeoutMs:number, ladder:string[],
+ *          minConfidence:number, sessionId?:string, currentEffort?:string}} opts
+ * @returns {Promise<{target:number, hold:number, release:boolean, stuck:number, reasons:string[], cost:number|null}>}
+ */
+export async function jevDecide(turn, opts) {
+  const body = await postDecision(opts, buildState(turn, opts.currentEffort), buildQuestions(opts.ladder));
   return { ...toAssessment(body?.answers, opts.ladder, opts.minConfidence), cost: body?.usage?.cost ?? null };
+}
+
+const UNFINISHED_QUESTION = {
+  type: 'noul',
+  instructions: "The coding agent just ended its turn. Did it stop before finishing the user's task, although it could keep going without the user's input?",
+  criteria: {
+    true: 'Work it said it would do is not done, plan steps are open, changes are unverified, or it asks permission to continue routine work.',
+    false: 'The task is done and verified, or it needs information, a decision or credentials only the user can give.',
+  },
+};
+
+/**
+ * Asks Jev whether a generation that ended the turn stopped before the task was done.
+ * @param {object} turn the parsed turn (userText, steps)
+ * @param {{total:number, done:number, open:string[]}|null} plan
+ * @param {string} finalText the text of the generation that ended the turn
+ * @param {{url:string, apiKey:string, model:string, timeoutMs:number, sessionId?:string}} opts
+ * @returns {Promise<{unfinished:number, reasons:string[], cost:number|null}>}
+ */
+export async function jevStopCheck(turn, plan, finalText, opts) {
+  const state = {
+    ...buildState(turn, null),
+    final_message: String(finalText ?? '').slice(0, MAX_FINAL),
+    plan: plan ? { total: plan.total, done: plan.done, open: [...(plan.open ?? [])] } : null,
+  };
+  const body = await postDecision(opts, state, { unfinished: UNFINISHED_QUESTION });
+  const unfinished = body?.answers?.unfinished?.noul;
+  if (!Number.isFinite(unfinished)) throw new Error('Jev returned an unexpected answer shape');
+  return { unfinished, reasons: [`jev unfinished ${unfinished.toFixed(2)}`], cost: body?.usage?.cost ?? null };
 }

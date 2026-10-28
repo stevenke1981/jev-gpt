@@ -1,17 +1,22 @@
 // Transparent Responses / Chat Completions proxy that rewrites only the reasoning
 // effort, so the prompt prefix (and therefore prompt caching) is untouched.
 // A routed `jev-auto` request also gets its model rewritten to the one configured model.
+// Long-task help: a routed request whose plan has open steps gets a reminder at its end,
+// and a Responses turn the model ended early is resumed on the same stream (splice.js).
 import http from 'node:http';
 import zlib from 'node:zlib';
 import { createRouter } from './router.js';
 import { parseTurn } from './trajectory.js';
 import { parseChatTurn, chatWantsReasoning, applyChatEffort, chatSessionKey } from './chat.js';
-import { createDecisionLog, formatDecision, usageTokens } from './log.js';
+import { createDecisionLog, formatDecision, formatContinue, usageTokens } from './log.js';
 import { wantsModelRouting, modelId, clampEffort } from './model.js';
+import { turnPlan, finalOutput, assessStop, nudgeText, continueText } from './longtask.js';
+import { jevStopCheck } from './decisions.js';
+import {
+  continuationBody, developerMessage, forwardHeaders, isEventStream, pipeWithContinuation, writeChunk, writeUpstreamHead,
+} from './splice.js';
 import { VERSION, BUILD, APP } from './version.js';
 
-const HOP_BY_HOP = new Set(['host', 'connection', 'keep-alive', 'transfer-encoding', 'content-length',
-  'content-encoding', 'accept-encoding', 'proxy-connection', 'upgrade', 'te', 'trailer']);
 const DECODERS = {
   zstd: (b) => zlib.zstdDecompressSync(b),
   gzip: (b) => zlib.gunzipSync(b),
@@ -33,14 +38,6 @@ function decode(buf, encoding) {
   const fn = DECODERS[encoding.toLowerCase()];
   if (!fn) throw new Error(`unsupported content-encoding: ${encoding}`);
   return fn(buf);
-}
-
-function forwardHeaders(headers) {
-  const out = {};
-  for (const [k, v] of Object.entries(headers)) {
-    if (!HOP_BY_HOP.has(k.toLowerCase()) && v != null) out[k] = Array.isArray(v) ? v.join(', ') : v;
-  }
-  return out;
 }
 
 export function isChatGptAuth(headers) {
@@ -75,12 +72,13 @@ const MAX_JSON_SNIFF = 4 * 1024 * 1024;
 const SNIFF_MARKERS = ['"usage"', 'output_item.done'];
 
 // Per-protocol hooks: how to read the trajectory, whether the request is a
-// reasoning request, and how to rewrite its effort.
+// reasoning request, how to rewrite its effort, and where a plan reminder goes.
 const PROTOCOLS = {
   responses: {
     parse: (body) => parseTurn(body.input),
     wantsReasoning: (body) => body.reasoning != null && typeof body.reasoning === 'object',
     apply: (body, effort) => ({ ...body, reasoning: { ...body.reasoning, effort } }),
+    remind: (body, text) => ({ ...body, input: [...(Array.isArray(body.input) ? body.input : []), developerMessage(text)] }),
     session: sessionKeyOf,
     judge: true,
   },
@@ -88,6 +86,7 @@ const PROTOCOLS = {
     parse: (body) => parseChatTurn(body.messages),
     wantsReasoning: chatWantsReasoning,
     apply: applyChatEffort,
+    remind: (body, text) => ({ ...body, messages: [...(Array.isArray(body.messages) ? body.messages : []), { role: 'system', content: text }] }),
     session: chatSessionKey,
     // The LLM judge speaks the Responses API, which chat-only upstreams lack.
     judge: false,
@@ -154,30 +153,15 @@ function usageSniffer(contentType, onEvent = () => {}) {
 }
 
 async function pipeUpstream(res, upstream, onChunk) {
-  const headers = forwardHeaders(Object.fromEntries(upstream.headers));
-  const cookies = upstream.headers.getSetCookie();
-  if (cookies.length) headers['set-cookie'] = cookies;
-  res.writeHead(upstream.status, headers);
+  writeUpstreamHead(res, upstream);
   if (!upstream.body) return res.end();
   for await (const chunk of upstream.body) {
     onChunk?.(chunk);
-    // Respect backpressure so a slow client does not make us buffer the whole stream.
-    if (!res.write(chunk) && !res.destroyed) await drainOrClose(res);
+    // writeChunk waits for drain, so a slow client does not make us buffer the whole stream.
+    await writeChunk(res, chunk);
     if (res.destroyed) return;
   }
   res.end();
-}
-
-function drainOrClose(res) {
-  return new Promise((resolve) => {
-    const done = () => {
-      res.off('drain', done);
-      res.off('close', done);
-      resolve();
-    };
-    res.on('drain', done);
-    res.on('close', done);
-  });
 }
 
 function abortOnClose(res) {
@@ -200,12 +184,27 @@ function describeSent(decision, { applyEffort, model, requested }) {
   };
 }
 
+// The copy of a request that carries the plan reminder at its end, or null when the plan
+// has no open step (a finished or missing plan gets no reminder).
+function withPlanReminder(protocol, body) {
+  const plan = turnPlan(body);
+  if (!plan || plan.open.length === 0) return null;
+  return protocol.remind(body, nudgeText(plan));
+}
+
+// The error text for a stop-check fallback: one line, at most MAX_FAILURE_NOTE characters.
+const MAX_FAILURE_NOTE = 80;
+function failureNote(err) {
+  return String(err?.message ?? err).replace(/[\r\n]+/g, ' ').slice(0, MAX_FAILURE_NOTE);
+}
+
 export function createProxy(config, deps = {}) {
   const router = createRouter(config, deps);
   const log = deps.log ?? createDecisionLog(config);
   const print = deps.print ?? ((s) => process.stdout.write(`${s}\n`));
   const openRouterOf = deps.isOpenRouter ?? isOpenRouter;
-  const stats = { requests: 0, routed: 0, byEffort: {}, reasoningTokens: {} };
+  const stopCheckFn = deps.stopCheckFn ?? jevStopCheck;
+  const stats = { requests: 0, routed: 0, byEffort: {}, reasoningTokens: {}, continued: 0, nudged: 0 };
   const identity = { app: APP, version: VERSION, build: BUILD, pid: process.pid, startedAt: new Date().toISOString() };
 
   // Effort for this generation, or null when the request is left alone.
@@ -225,6 +224,90 @@ export function createProxy(config, deps = {}) {
   function countSent(sent) {
     stats.routed++;
     if (sent.effort) stats.byEffort[sent.effort] = (stats.byEffort[sent.effort] ?? 0) + 1;
+  }
+
+  // How unfinished a generation that ended the turn looks. Jev judges it in jev mode; when
+  // Jev fails, the heuristic decides instead, and `source` says which one did.
+  async function stopCheck(turn, plan, text, session) {
+    if (config.mode !== 'jev') return { ...assessStop(turn, plan, text), source: 'heuristic' };
+    try {
+      const judged = await stopCheckFn(turn, plan, text, {
+        url: config.decisionUrl,
+        apiKey: config.openrouterKey,
+        model: config.decisionModel,
+        timeoutMs: config.judgeTimeoutMs,
+        sessionId: session,
+      });
+      return { ...judged, source: 'jev' };
+    } catch (err) {
+      return { ...assessStop(turn, plan, text), source: `heuristic (jev failed: ${failureNote(err)})` };
+    }
+  }
+
+  // Resumes a turn the model ended before the work was done. Returns the continuation
+  // Response whose events replace the held completed event, or null to release that event.
+  async function resumeTurn(trail, data) {
+    const response = data?.response;
+    if (!response) return null;
+    const { ended, text } = finalOutput(response);
+    if (!ended) return null;
+    const plan = turnPlan(trail.body);
+    const turn = parseTurn(trail.body.input);
+    if (turn.steps.length === 0 && plan == null) return null;
+    if (router.continuesOf(trail.session) >= config.maxContinues) return null;
+    const stop = await stopCheck(turn, plan, text, trail.session);
+    if (stop.unfinished < config.continueThreshold) return null;
+    // Another stream of this session may have taken the last slot while the stop check ran.
+    if (router.continuesOf(trail.session) >= config.maxContinues) return null;
+
+    const { continues, effort } = router.noteContinue(trail.session);
+    const body = continuationBody(trail.body, response.output, continueText(plan, stop.reasons), clampEffort(effort));
+    const next = await fetch(trail.url, {
+      method: 'POST', headers: trail.headers, body: JSON.stringify(body), signal: trail.signal,
+    });
+    if (!next.ok || !isEventStream(next)) {
+      process.stderr.write(`jev: resume #${continues} failed: HTTP ${next.status}\n`);
+      return next;
+    }
+    trail.body = body;
+    const resume = { n: continues, effort, unfinished: stop.unfinished, source: stop.source, reasons: stop.reasons };
+    trail.resumes.push(resume);
+    stats.continued++;
+    if (!config.quiet) print(formatContinue({ ...resume, step: turn.steps.length + 1 }));
+    return next;
+  }
+
+  // Streams the upstream answer. Only a resumable Responses stream is watched for a turn to continue.
+  async function relay(res, upstream, { resumable, trail }) {
+    if (!resumable) {
+      const sniff = usageSniffer(upstream.headers.get('content-type'));
+      await pipeUpstream(res, upstream, (c) => sniff.push(c));
+      sniff.finish();
+      return sniff.usage;
+    }
+    await pipeWithContinuation(res, upstream, {
+      onEvent: (event) => {
+        trail.usage = event.response?.usage ?? trail.usage;
+      },
+      onCompleted: (data) => resumeTurn(trail, data),
+      onError: (err) => process.stderr.write(`jev: resume failed: ${err.message}\n`),
+    });
+    return trail.usage;
+  }
+
+  // Stats and the decision log of a routed request, once its answer has been relayed.
+  function recordRouted({ sent, session, protocol, nudged, trail, usage, status }) {
+    const { reasoning } = usageTokens(usage);
+    if (reasoning != null && sent.effort) {
+      stats.reasoningTokens[sent.effort] = (stats.reasoningTokens[sent.effort] ?? 0) + reasoning;
+    }
+    log.write({
+      ts: new Date().toISOString(), session, api: protocol === PROTOCOLS.chat ? 'chat' : 'responses',
+      ...sent,
+      ...(nudged ? { nudged: true } : {}),
+      ...(trail.resumes.length ? { continues: trail.resumes } : {}),
+      status, usage,
+    });
   }
 
   async function handleRouted(req, res, raw, protocol) {
@@ -253,6 +336,9 @@ export function createProxy(config, deps = {}) {
     const turn = protocol.parse(body);
     const decision = await decide(body, turn, { session, judgeTarget, applyEffort, routeModel });
     if (decision) body = rewriteRequest(protocol, body, decision, { applyEffort, inject, openRouter, routeModel });
+    const reminded = decision && config.nudge && config.mode !== 'off' ? withPlanReminder(protocol, body) : null;
+    if (reminded) stats.nudged++;
+    body = reminded ?? body;
 
     const upstreamModel = body.model;
     const sent = decision ? describeSent(decision, { applyEffort, model: upstreamModel, requested }) : null;
@@ -261,26 +347,15 @@ export function createProxy(config, deps = {}) {
       if (!config.quiet) print(formatDecision(sent));
     }
 
-    const upstream = await fetch(url, {
-      method: 'POST',
-      headers: { ...forwardHeaders(req.headers), 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-      signal: abortOnClose(res),
-    });
-    const sniff = usageSniffer(upstream.headers.get('content-type'));
-    await pipeUpstream(res, upstream, (c) => sniff.push(c));
-    sniff.finish();
-
-    if (sent) {
-      const { reasoning } = usageTokens(sniff.usage);
-      if (reasoning != null && sent.effort) {
-        stats.reasoningTokens[sent.effort] = (stats.reasoningTokens[sent.effort] ?? 0) + reasoning;
-      }
-      log.write({
-        ts: new Date().toISOString(), session, api: protocol === PROTOCOLS.chat ? 'chat' : 'responses',
-        ...sent, status: upstream.status, usage: sniff.usage,
-      });
-    }
+    const headers = { ...forwardHeaders(req.headers), 'content-type': 'application/json' };
+    const signal = abortOnClose(res);
+    const upstream = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal });
+    const resumable = sent != null && config.continueTurns && config.mode !== 'off'
+      && protocol === PROTOCOLS.responses && body.stream === true
+      && upstream.status === 200 && isEventStream(upstream);
+    const trail = { body, session, url, headers, signal, resumes: [], usage: null };
+    const usage = await relay(res, upstream, { resumable, trail });
+    if (sent) recordRouted({ sent, session, protocol, nudged: reminded != null, trail, usage, status: upstream.status });
   }
 
   async function handle(req, res) {

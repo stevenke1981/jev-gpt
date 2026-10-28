@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { buildState, buildQuestions, toAssessment, jevDecide } from '../src/decisions.js';
+import { buildState, buildQuestions, toAssessment, jevDecide, jevStopCheck } from '../src/decisions.js';
 import { createRouter } from '../src/router.js';
 import { loadConfig } from '../src/config.js';
 
@@ -70,6 +70,64 @@ test('jevDecide posts a Decisions request and returns cost', async () => {
     assert.deepEqual(Object.keys(seen[0].body.questions), ['effort', 'stuck']);
   } finally {
     server.close();
+  }
+});
+
+const stopOpts = (url, extra = {}) => ({ url, apiKey: 'or-test', model: 'typesafe/jev-1.14', timeoutMs: 2000, ...extra });
+const unfinishedReply = (noul, cost = 0.00003) => (res) => {
+  res.writeHead(200, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({ answers: { unfinished: { type: 'noul', noul } }, usage: { cost } }));
+};
+
+test('jevStopCheck asks one unfinished question with the turn, final text and plan', async () => {
+  const { server, seen, url } = await decisionsServer(unfinishedReply(0.82));
+  try {
+    const plan = { total: 3, done: 1, open: ['write tests', 'update docs'] };
+    const r = await jevStopCheck(turn, plan, 'Next I will add tests.', stopOpts(url, { sessionId: 's2' }));
+    assert.deepEqual(r, { unfinished: 0.82, reasons: ['jev unfinished 0.82'], cost: 0.00003 });
+    assert.equal(seen[0].headers.authorization, 'Bearer or-test');
+    assert.equal(seen[0].body.model, 'typesafe/jev-1.14');
+    assert.equal(seen[0].body.session_id, 's2');
+    assert.deepEqual(Object.keys(seen[0].body.questions), ['unfinished']);
+    assert.equal(seen[0].body.questions.unfinished.type, 'noul');
+    assert.match(seen[0].body.questions.unfinished.instructions, /ended its turn/);
+    assert.deepEqual(seen[0].body.state.plan, plan);
+    assert.equal(seen[0].body.state.final_message, 'Next I will add tests.');
+    assert.equal(seen[0].body.state.totals.tool_calls, 3);
+    assert.equal(seen[0].body.state.task, 'find bugs');
+  } finally {
+    server.close();
+  }
+});
+
+test('jevStopCheck truncates the final message, sends a null plan and no session when absent', async () => {
+  const { server, seen, url } = await decisionsServer(unfinishedReply(0.1));
+  try {
+    const r = await jevStopCheck(turn, null, 'x'.repeat(5000), stopOpts(url));
+    assert.equal(r.unfinished, 0.1);
+    assert.equal(seen[0].body.state.final_message.length, 2000);
+    assert.equal(seen[0].body.state.plan, null);
+    assert.equal('session_id' in seen[0].body, false);
+  } finally {
+    server.close();
+  }
+});
+
+test('jevStopCheck throws on an HTTP error and on a non-number answer', async () => {
+  const failing = await decisionsServer((res) => {
+    res.writeHead(500, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: 'boom' } }));
+  });
+  try {
+    await assert.rejects(jevStopCheck(turn, null, 'done', stopOpts(failing.url)), /Jev HTTP 500: boom/);
+  } finally {
+    failing.server.close();
+  }
+  const malformed = await decisionsServer(unfinishedReply('high'));
+  try {
+    await assert.rejects(jevStopCheck(turn, null, 'done', stopOpts(malformed.url)), /unexpected answer shape/);
+  } finally {
+    malformed.server.close();
   }
 });
 

@@ -23,6 +23,13 @@ export function formatDecision(d) {
     + `${C.dim}     ${detail.join(' · ')}${C.reset}`;
 }
 
+// The resume line: "Jev  RESUME #2 → HIGH  ✓ APPLIED", then the step, unfinished score and reasons.
+export function formatContinue(c) {
+  const detail = [`Step ${c.step}`, `unfinished ${c.unfinished.toFixed(2)}`, c.source, (c.reasons ?? []).join('; ')];
+  return `${C.blue}Jev${C.reset}  ${C.bold}RESUME #${c.n} → ${c.effort.toUpperCase()}${C.reset}  ${C.green}✓ APPLIED${C.reset}\n`
+    + `${C.dim}     ${detail.filter(Boolean).join(' · ')}${C.reset}`;
+}
+
 export function createDecisionLog(config) {
   fs.mkdirSync(path.dirname(config.logFile), { recursive: true });
   return {
