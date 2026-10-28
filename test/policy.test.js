@@ -40,10 +40,15 @@ test('classifies wrapped shell commands', () => {
   assert.equal(classifyCall({ type: 'function_call', name: 'exec_command', arguments: '{"cmd":"git status --short"}' }), 'read');
 });
 
-test('greeting and plain first step stay low; hard tasks start medium', () => {
-  assert.equal(assess(parseTurn([user('hi!')]), LADDER).target, 0);
-  assert.equal(assess(parseTurn([user('inspect this repo and find bugs.')]), LADDER).target, 0);
-  assert.equal(assess(parseTurn([user('why does this deadlock under load?')]), LADDER).target, 1);
+test('a turn starts at the default effort; greetings go low and hard tasks one rung above', () => {
+  assert.equal(assess(parseTurn([user('hi!')]), LADDER, 'medium').target, 0);
+  assert.equal(assess(parseTurn([user('inspect this repo and find bugs.')]), LADDER, 'medium').target, 1);
+  assert.equal(assess(parseTurn([user('why does this deadlock under load?')]), LADDER, 'medium').target, 2);
+  // Another default moves the start; the top rung caps a hard task.
+  assert.equal(assess(parseTurn([user('inspect this repo and find bugs.')]), LADDER, 'low').target, 0);
+  assert.equal(assess(parseTurn([user('why does this deadlock under load?')]), LADDER, 'high').target, 2);
+  // Without a default the middle rung is the start.
+  assert.equal(assess(parseTurn([user('inspect this repo and find bugs.')]), LADDER).target, 1);
 });
 
 test('escalates with consecutive failures and repeated failing calls', () => {
@@ -130,12 +135,12 @@ test('isNewTurn: first generation, step restart, or no state; continuing steps a
   assert.equal(isNewTurn({ step: 4 }, 5), false);
 });
 
-test('model-routing constants are shared with the policy', () => {
+test('task constants are exported', () => {
   assert.ok(HARD_TASK.test('why does this race?'));
   assert.equal(LONG_PROMPT_CHARS, 600);
 });
 
-test('a deep question starts at the middle rung like a hard task', () => {
-  const a = assess({ userText: 'How does the scheduler pick the next task?', steps: [] }, ['low', 'medium', 'high', 'xhigh']);
-  assert.equal(a.target, 1);
+test('a deep question starts one rung above the default like a hard task', () => {
+  const a = assess({ userText: 'How does the scheduler pick the next task?', steps: [] }, ['low', 'medium', 'high', 'xhigh'], 'medium');
+  assert.equal(a.target, 2);
 });

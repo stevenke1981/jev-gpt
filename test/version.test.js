@@ -9,13 +9,13 @@ test('build is a stable short hash and version comes from package.json', () => {
   assert.match(VERSION, /^\d+\.\d+\.\d+/);
 });
 
-test('isOurProxy accepts only health payloads that name jev-sol-terra', () => {
-  assert.equal(APP, 'jev-sol-terra');
-  assert.equal(isOurProxy({ app: 'jev-sol-terra', pid: 7 }), true);
+test('isOurProxy accepts only health payloads that name jev-gpt', () => {
+  assert.equal(APP, 'jev-gpt');
+  assert.equal(isOurProxy({ app: 'jev-gpt', pid: 7 }), true);
   // Another app, an older payload without the field, and no payload at all are not ours.
   assert.equal(isOurProxy({ app: 'jev-effort', pid: 7 }), false);
   assert.equal(isOurProxy({ version: '0.4.0', build: 'aaaaaaaaaaaa', pid: 7 }), false);
-  assert.equal(isOurProxy({ app: 'JEV-SOL-TERRA' }), false);
+  assert.equal(isOurProxy({ app: 'JEV-GPT' }), false);
   assert.equal(isOurProxy(null), false);
   assert.equal(isOurProxy(undefined), false);
 });
@@ -26,7 +26,7 @@ test('compareBuild tells current, stale and pre-version proxies apart', () => {
   assert.equal(compareBuild(health, local).status, 'current');
   const stale = compareBuild({ ...health, build: 'bbbbbbbbbbbb' }, local);
   assert.equal(stale.status, 'stale');
-  assert.match(stale.message, /pid 7.*rerun "jev-sol-terra serve"/);
+  assert.match(stale.message, /pid 7.*rerun "jev-gpt serve"/);
   // Proxies from before this check report no build at all.
   assert.equal(compareBuild({ ok: true, mode: 'heuristic' }, local).status, 'stale');
   assert.match(compareBuild({ ok: true }, local).message, /older version without build info/);

@@ -1,10 +1,10 @@
 {
-  "name": "jev-sol-terra",
-  "version": "0.3.0",
-  "description": "Routes each generation between GPT-6.1 Terra and GPT-6.1 Sol and picks the reasoning effort (low..xhigh) mid-task.",
+  "name": "jev-gpt",
+  "version": "0.1.0",
+  "description": "Runs one GPT model (GPT-6.1 Terra), lets Jev pick the reasoning effort (low..xhigh) per generation, and resumes long tasks the model stops too early.",
   "type": "module",
   "bin": {
-    "jev-sol-terra": "bin/jev.js"
+    "jev-gpt": "bin/jev.js"
   },
   "scripts": {
     "start": "node bin/jev.js serve",

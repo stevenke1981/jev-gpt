@@ -161,13 +161,31 @@ test('config rejects invalid ladders and modes', () => {
   assert.throws(() => loadConfig({ JEV_MODE: 'smart' }), /JEV_MODE/);
 });
 
-test('the x-jev-role hint is not forwarded upstream', async () => {
-  const h = await harness();
+test('jev-auto is rewritten to the configured model id; other models keep their name', async () => {
+  const h = await harness({ JEV_MODE: 'heuristic' });
+  try {
+    const post = (model) => fetch(`http://127.0.0.1:${h.port}/v1/responses`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(request([user('hi')], { model })),
+    }).then((r) => r.text());
+    await post('jev-auto');
+    await post('gpt-x');
+    assert.equal(JSON.parse(h.seen[0].body).model, 'gpt-6.1-terra');
+    assert.equal(JSON.parse(h.seen[1].body).model, 'gpt-x');
+    assert.deepEqual(h.logged.map((r) => [r.requested, r.model]), [['jev-auto', 'gpt-6.1-terra'], ['gpt-x', 'gpt-x']]);
+  } finally {
+    h.close();
+  }
+});
+
+test('JEV_MODE=off still maps jev-auto to the model and leaves the effort alone', async () => {
+  const h = await harness({ JEV_MODE: 'off' });
   try {
     await fetch(`http://127.0.0.1:${h.port}/v1/responses`, {
-      method: 'POST', headers: { 'content-type': 'application/json', 'x-jev-role': 'worker' }, body: JSON.stringify(request([user('hi')])),
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(request([user('hi')], { model: 'jev-auto' })),
     }).then((r) => r.text());
-    assert.equal(h.seen[0].headers['x-jev-role'], undefined);
+    const sent = JSON.parse(h.seen[0].body);
+    assert.equal(sent.model, 'gpt-6.1-terra');
+    assert.equal(sent.reasoning.effort, 'high');
   } finally {
     h.close();
   }

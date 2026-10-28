@@ -1,20 +1,17 @@
 // Transparent Responses / Chat Completions proxy that rewrites only the reasoning
 // effort, so the prompt prefix (and therefore prompt caching) is untouched.
-// A routed `jev-auto` request also gets its model rewritten (GPT-6.1 Terra or Sol).
+// A routed `jev-auto` request also gets its model rewritten to the one configured model.
 import http from 'node:http';
 import zlib from 'node:zlib';
 import { createRouter } from './router.js';
 import { parseTurn } from './trajectory.js';
 import { parseChatTurn, chatWantsReasoning, applyChatEffort, chatSessionKey } from './chat.js';
 import { createDecisionLog, formatDecision, usageTokens } from './log.js';
-import { wantsModelRouting, modelId, clampEffort, agentRole } from './model.js';
-import { createReasoningTracker } from './reasoning.js';
+import { wantsModelRouting, modelId, clampEffort } from './model.js';
 import { VERSION, BUILD, APP } from './version.js';
 
 const HOP_BY_HOP = new Set(['host', 'connection', 'keep-alive', 'transfer-encoding', 'content-length',
-  'content-encoding', 'accept-encoding', 'proxy-connection', 'upgrade', 'te', 'trailer',
-  // Our own role hint; the upstream has no use for it.
-  'x-jev-role']);
+  'content-encoding', 'accept-encoding', 'proxy-connection', 'upgrade', 'te', 'trailer']);
 const DECODERS = {
   zstd: (b) => zlib.zstdDecompressSync(b),
   gzip: (b) => zlib.gunzipSync(b),
@@ -189,29 +186,17 @@ function abortOnClose(res) {
   return controller.signal;
 }
 
-// JEV_MODE=off leaves the effort alone, but a jev-auto alias still needs a real model:
-// the pinned one, else terra.
-function offModeModel(config) {
-  const pinned = config.modelMode !== 'auto';
-  return {
-    effort: null, from: null, step: 0, hold: 0, reasons: [], source: 'off', cost: null, ms: 0,
-    model: pinned ? config.modelMode : 'terra',
-    fromModel: null,
-    modelReasons: [pinned ? 'pinned model' : 'mode off: terra'],
-  };
-}
+// JEV_MODE=off leaves the effort alone, but a jev-auto alias still needs the real model id.
+const OFF_DECISION = Object.freeze({ effort: null, from: null, step: 0, hold: 0, reasons: ['mode off'], source: 'off', cost: null, ms: 0 });
 
 // The decision as it went upstream: the effort only when it was applied, the model as sent.
-// `modelKey` keeps the configured key ('terra' | 'sol') for display; `model` is the upstream id.
 function describeSent(decision, { applyEffort, model, requested }) {
-  const { model: modelKey, ...rest } = decision;
   return {
-    ...rest,
-    modelKey,
+    ...decision,
     model,
     requested,
-    effort: applyEffort ? clampEffort(modelKey, rest.effort) : null,
-    from: applyEffort ? rest.from : null,
+    effort: applyEffort ? clampEffort(decision.effort) : null,
+    from: applyEffort ? decision.from : null,
   };
 }
 
@@ -220,42 +205,35 @@ export function createProxy(config, deps = {}) {
   const log = deps.log ?? createDecisionLog(config);
   const print = deps.print ?? ((s) => process.stdout.write(`${s}\n`));
   const openRouterOf = deps.isOpenRouter ?? isOpenRouter;
-  const tracker = createReasoningTracker();
-  const stats = { requests: 0, routed: 0, byEffort: {}, byModel: {}, reasoningTokens: {} };
+  const stats = { requests: 0, routed: 0, byEffort: {}, reasoningTokens: {} };
   const identity = { app: APP, version: VERSION, build: BUILD, pid: process.pid, startedAt: new Date().toISOString() };
 
-  // Model and effort for this generation, or null when the request is left alone.
-  async function decide(protocol, body, plain, { session, judgeTarget, applyEffort, routeModel, role }) {
-    if (config.mode === 'off') return routeModel ? offModeModel(config) : null;
+  // Effort for this generation, or null when the request is left alone.
+  async function decide(body, turn, { session, judgeTarget, applyEffort, routeModel }) {
+    if (config.mode === 'off') return routeModel ? OFF_DECISION : null;
     if (!applyEffort && !routeModel) return null;
-    return router.route(body, session, judgeTarget, protocol.parse(body), { routeModel, bodyBytes: plain.length, role });
+    return router.route(body, session, judgeTarget, turn);
   }
 
-  // Applies the decision to a copy of the request: the effort when it is applied, then the
-  // model id. Responses also drops the reasoning items the routed model cannot read.
-  function rewriteRequest(protocol, body, decision, { applyEffort, inject, openRouter }) {
-    const withEffort = applyEffort ? protocol.apply(body, clampEffort(decision.model, decision.effort), inject) : body;
-    if (!decision.model) return withEffort;
-    const routed = { ...withEffort, model: modelId(decision.model, config, openRouter) };
-    return protocol === PROTOCOLS.responses ? { ...routed, input: tracker.strip(routed.input, routed.model) } : routed;
+  // Applies the decision to a copy of the request: the effort when it is applied, and the
+  // configured model id when the client handed the model choice to us.
+  function rewriteRequest(protocol, body, decision, { applyEffort, inject, openRouter, routeModel }) {
+    const withEffort = applyEffort ? protocol.apply(body, clampEffort(decision.effort), inject) : body;
+    return routeModel ? { ...withEffort, model: modelId(config, openRouter) } : withEffort;
   }
 
   function countSent(sent) {
     stats.routed++;
     if (sent.effort) stats.byEffort[sent.effort] = (stats.byEffort[sent.effort] ?? 0) + 1;
-    const model = String(sent.model ?? '-');
-    stats.byModel[model] = (stats.byModel[model] ?? 0) + 1;
   }
 
   async function handleRouted(req, res, raw, protocol) {
     const base = upstreamBase(config, req.headers);
     const url = upstreamUrl(base, req.url);
     let body;
-    let plain;
     try {
-      // Codex compresses with zstd; the downgrade guard needs the decoded size.
-      plain = decode(raw, req.headers['content-encoding']);
-      body = JSON.parse(plain.toString('utf8'));
+      // Codex compresses with zstd.
+      body = JSON.parse(decode(raw, req.headers['content-encoding']).toString('utf8'));
       if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('expected a JSON object');
     } catch (err) {
       res.writeHead(400, { 'content-type': 'application/json' });
@@ -269,12 +247,12 @@ export function createProxy(config, deps = {}) {
     const inject = protocol === PROTOCOLS.chat && openRouter;
     const applyEffort = config.mode !== 'off' && (protocol.wantsReasoning(body) || inject);
     const routeModel = wantsModelRouting(body, config);
-    // An alias like jev-auto is not a real model, so the judge runs on the cheap one.
-    const judgeModel = routeModel ? modelId('terra', config, openRouter) : body.model;
+    // An alias like jev-auto is not a real model, so the judge runs on the configured one.
+    const judgeModel = routeModel ? modelId(config, openRouter) : body.model;
     const judgeTarget = protocol.judge ? { url, headers: forwardHeaders(req.headers), model: judgeModel } : null;
-    const role = routeModel && config.agents === 'parallel' ? agentRole(req.headers) : null;
-    const decision = await decide(protocol, body, plain, { session, judgeTarget, applyEffort, routeModel, role });
-    if (decision) body = rewriteRequest(protocol, body, decision, { applyEffort, inject, openRouter });
+    const turn = protocol.parse(body);
+    const decision = await decide(body, turn, { session, judgeTarget, applyEffort, routeModel });
+    if (decision) body = rewriteRequest(protocol, body, decision, { applyEffort, inject, openRouter, routeModel });
 
     const upstreamModel = body.model;
     const sent = decision ? describeSent(decision, { applyEffort, model: upstreamModel, requested }) : null;
@@ -289,8 +267,7 @@ export function createProxy(config, deps = {}) {
       body: JSON.stringify(body),
       signal: abortOnClose(res),
     });
-    const onEvent = protocol === PROTOCOLS.responses ? (event) => tracker.observe(event, upstreamModel) : undefined;
-    const sniff = usageSniffer(upstream.headers.get('content-type'), onEvent);
+    const sniff = usageSniffer(upstream.headers.get('content-type'));
     await pipeUpstream(res, upstream, (c) => sniff.push(c));
     sniff.finish();
 
@@ -301,7 +278,7 @@ export function createProxy(config, deps = {}) {
       }
       log.write({
         ts: new Date().toISOString(), session, api: protocol === PROTOCOLS.chat ? 'chat' : 'responses',
-        ...sent, ...(role ? { role } : {}), status: upstream.status, usage: sniff.usage,
+        ...sent, status: upstream.status, usage: sniff.usage,
       });
     }
   }

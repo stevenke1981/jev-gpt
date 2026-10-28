@@ -2,26 +2,30 @@
 // trajectory. Escalates when the agent looks stuck, decays on routine steps.
 
 export const HARD_TASK = /\b(design|architect|architecture|refactor|race|deadlock|concurren|security|vulnerab|prove|proof|optimi[sz]e|performance|migrat|why|root cause|debug|investigate)\b|設計|架構|重構|除錯|根因|為什麼|為何|優化|效能/i;
-// Questions that ask for understanding rather than an action: Sol's other strength.
+// Questions that ask for understanding rather than an action also start above the default.
 export const DEEP_QUESTION = /\b(how (does|do|did|is|are|come)|explain (how|why)|in depth|deep dive|trade-?offs?|algorithm|complexity|analy[sz]e|analysis|compare|comparison)\b|深入|原理|分析|比較|權衡|取捨|演算法|複雜度|推導|證明|怎麼運作|如何運作|運作機制|為何會/i;
 const GREETING =/^\s*(hi|hello|hey|yo|thanks|thank you|ok|okay|你好|嗨|謝謝|好)\W*$/i;
 export const LONG_PROMPT_CHARS = 600;
 const SYNTHESIS_READS = 4;
 const REPEAT_WINDOW = 6;
 
-/** Index into `ladder` the trajectory asks for, plus reasons and hold. */
-export function assess(turn, ladder) {
+/**
+ * Index into `ladder` the trajectory asks for, plus reasons and hold.
+ * @param {string} [defaultEffort] where a turn starts without a trivial or hard signal
+ */
+export function assess(turn, ladder, defaultEffort = ladder[Math.min(1, ladder.length - 1)]) {
   const top = ladder.length - 1;
   const mid = Math.min(1, top);
+  const start = Math.max(0, ladder.indexOf(defaultEffort));
   const reasons = [];
   const { steps, userText } = turn;
 
   if (steps.length === 0) {
     if (GREETING.test(userText)) return { target: 0, hold: 0, reasons: ['greeting'] };
     if (userText.length > LONG_PROMPT_CHARS || HARD_TASK.test(userText) || DEEP_QUESTION.test(userText)) {
-      return { target: mid, hold: 0, reasons: ['hard task, planning'] };
+      return { target: Math.min(start + 1, top), hold: 0, reasons: ['hard task, planning'] };
     }
-    return { target: 0, hold: 0, reasons: ['first step'] };
+    return { target: start, hold: 0, reasons: ['first step, default effort'] };
   }
 
   const streak = failureStreak(steps);
@@ -73,7 +77,7 @@ function countSinceLast(steps, kind, pred) {
 
 /**
  * True when generation `step` starts a new user turn rather than continuing the previous one.
- * Shared by effort hysteresis and model routing so both reset at the same point.
+ * Shared by effort hysteresis and the long-task state so both reset at the same point.
  * @param {{step:number}|undefined} prev session state
  * @param {number} step 1-based generation index
  */
