@@ -74,10 +74,11 @@ git clone https://github.com/stevenke1981/jev-gpt.git
 cd jev-gpt                 # 一定要在這個資料夾執行 npm link
 npm link                   # 註冊全域指令 jev-gpt（或直接 node bin/jev.js ...）
 jev-gpt --version
+Copy-Item .env.example .env.local   # 填入 OPENROUTER_API_KEY（見「API keys / 金鑰設定」）
 jev-gpt install            # 寫入 $CODEX_HOME/jevgpt.config.toml（預設 ~/.codex）
 ```
 
-`install` 寫入的 Codex profile：`model = "gpt-6.1-terra"`、`model_reasoning_effort = "medium"`、`jevgpt` provider 指向 `http://127.0.0.1:8789/v1`、`wire_api = "responses"`、`requires_openai_auth = true`（沿用 Codex 既有登入）。檔案若存在且不是本工具寫入的，會拒絕覆寫，需加 `--force`。
+`install` 寫入的 Codex profile：`model = "gpt-6.1-terra"`、`model_reasoning_effort = "medium"`、`jevgpt` provider 指向 `http://127.0.0.1:8789/v1`、`wire_api = "responses"`、`requires_openai_auth = true`（沿用 Codex 既有登入；`--provider openai|openrouter` 改為 `env_key`，見「API keys / 金鑰設定」）。檔案若存在且不是本工具寫入的，會拒絕覆寫，需加 `--force`。
 
 ```powershell
 # A. 一鍵：背景啟動 proxy，再執行 codex -p jevgpt
@@ -127,6 +128,53 @@ $env:OPENAI_API_KEY = $env:OPENROUTER_API_KEY
 aider --openai-api-base http://127.0.0.1:8789/v1 --model openai/jev-auto
 ```
 
+## API keys / 金鑰設定
+
+| 金鑰 | 用途 | 何時需要 |
+|---|---|---|
+| `OPENROUTER_API_KEY` | Jev 決策（OpenRouter 上的 `typesafe/jev-1.14`），依呼叫計費；`install --provider openrouter` 時也是主模型的金鑰 | 要用 Jev 決定 effort 時必填；沒有它則 `JEV_MODE` 預設為 `heuristic` |
+| `OPENAI_API_KEY` | `install --provider openai` 時，主模型走 OpenAI API 的金鑰 | 只有選 openai 時需要 |
+
+`install --provider` 決定 Codex 如何替主模型驗證（寫入 `$CODEX_HOME/jevgpt.config.toml` 的 provider 表）：
+
+| `--provider` | profile 寫入 | 主模型去向 |
+|---|---|---|
+| `chatgpt`（預設） | `requires_openai_auth = true` | Codex 的 ChatGPT 登入 → `chatgpt.com/backend-api/codex` |
+| `openai` | `env_key = "OPENAI_API_KEY"` | Codex 送出 `sk-` 金鑰 → `api.openai.com/v1` |
+| `openrouter` | `env_key = "OPENROUTER_API_KEY"` | Codex 送出 `sk-or-` 金鑰 → OpenRouter，模型 id 改為 `openai/<id>` |
+
+### 三種設定方式
+
+1. **系統環境變數**（開新終端機後生效）：
+
+   ```powershell
+   [Environment]::SetEnvironmentVariable('OPENROUTER_API_KEY', 'sk-or-...', 'User')
+   ```
+
+   ```bash
+   export OPENROUTER_API_KEY=sk-or-...   # 寫進 ~/.bashrc 或 ~/.zshrc 才會保留
+   ```
+
+2. **專案的 `.env.local`**：
+
+   ```powershell
+   Copy-Item .env.example .env.local   # bash: cp .env.example .env.local
+   ```
+
+   再編輯 `.env.local` 填入金鑰。`.env`、`.env.local` 已列在 `.gitignore`，**不要 commit**。
+
+3. **全域安裝（npm link）的 `~/.jev-gpt/.env.local`**（`JEV_HOME` 可改位置）。
+
+### 優先順序
+
+1. 已設定的系統或 shell 環境變數（非空字串）優先，檔案不會覆蓋它。
+2. 專案資料夾的 `.env.local`，再 `.env`。
+3. `JEV_HOME`（預設 `~/.jev-gpt`）的 `.env.local`，再 `.env`。
+
+同一變數先找到者勝出。只讀取 `JEV_*`、`OPENAI_*`、`OPENROUTER_*` 變數，共用 `.env` 裡的其他秘密不會傳給 `codex`。檔案開頭的 UTF-8 BOM 會被忽略；檔案存在但讀不到時只顯示警告。`serve` 啟動時列出載入的檔案與變數名稱（不印出值）。
+
+注意：`jev-gpt codex` 啟動的 Codex 會繼承從 `.env.local` 讀到的金鑰；直接執行 `codex -p jevgpt` 或使用 Codex 桌面版時，`--provider openai`／`openrouter` 需要的金鑰必須設在系統環境變數。
+
 ## 設定（環境變數）
 
 | 變數 | 預設 | 說明 |
@@ -141,7 +189,9 @@ aider --openai-api-base http://127.0.0.1:8789/v1 --model openai/jev-auto
 | `JEV_MAX_CONTINUES` | `3` | 每個 turn 最多續跑次數 |
 | `JEV_CONTINUE_THRESHOLD` | `0.6` | `unfinished` 達此值才續跑 |
 | `JEV_NUDGE` | `on` | 計畫有未完成步驟時附加提醒 |
-| `OPENROUTER_API_KEY` | — | `jev` 模式必填 |
+| `OPENROUTER_API_KEY` | — | `jev` 模式必填；`--provider openrouter` 時也是主模型的金鑰 |
+| `OPENAI_API_KEY` | — | `--provider openai` 時主模型的金鑰 |
+| `JEV_PROVIDER` | `chatgpt` | `install` 寫入的驗證方式：`chatgpt`、`openai`、`openrouter`（同 `--provider`） |
 | `JEV_DECISION_MODEL` / `JEV_DECISION_URL` | `typesafe/jev-1.14` / OpenRouter Decisions API | Jev 決策 |
 | `JEV_MIN_CONFIDENCE` | `0.3` | Jev 信心低於此值改用規則 |
 | `JEV_JUDGE_MODEL` / `JEV_JUDGE_EFFORT` / `JEV_JUDGE_TIMEOUT_MS` | 請求模型 / `low` / `2500` | `llm` 判官；逾時也套用到 Jev 決策 |

@@ -32,6 +32,12 @@ function switchEnv(env, name, fallback) {
   return v === 'on';
 }
 
+function providerEnv(env) {
+  const v = (env.JEV_PROVIDER || 'chatgpt').toLowerCase();
+  if (!['chatgpt', 'openai', 'openrouter'].includes(v)) throw new Error(`JEV_PROVIDER must be chatgpt|openai|openrouter; got "${v}"`);
+  return v;
+}
+
 export function loadConfig(env = process.env) {
   const home = env.JEV_HOME || path.join(os.homedir(), '.jev-gpt');
   const openrouterKey = env.OPENROUTER_API_KEY || '';
@@ -62,6 +68,9 @@ export function loadConfig(env = process.env) {
     continueThreshold: probabilityEnv(env, 'JEV_CONTINUE_THRESHOLD', 0.6),
     nudge: switchEnv(env, 'JEV_NUDGE', 'on'),
     mode,
+    // How the Codex profile authenticates the main model: the ChatGPT login, OPENAI_API_KEY or
+    // OPENROUTER_API_KEY. The proxy picks the upstream from the key the client sends.
+    provider: providerEnv(env),
     // Fixed upstream; when unset the auth type picks ChatGPT backend, OpenRouter or API.
     upstream: env.JEV_UPSTREAM || '',
     chatgptUpstream: env.JEV_CHATGPT_UPSTREAM || 'https://chatgpt.com/backend-api/codex',

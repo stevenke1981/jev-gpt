@@ -5,7 +5,7 @@ import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn, execFile } from 'node:child_process';
+import { spawn, spawnSync, execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const CLI = fileURLToPath(new URL('../bin/jev.js', import.meta.url));
@@ -198,5 +198,27 @@ test('help names the jev-gpt commands, the variables and the port', async () => 
     assert.match(version.out, /^jev-gpt v\d+\.\d+\.\d+ \(build [0-9a-f]{12}\)/);
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('install --provider writes how Codex authenticates the main model', () => {
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'jev-provider-'));
+  try {
+    const run = (...args) => spawnSync(process.execPath, [CLI, 'install', '--force', ...args], {
+      encoding: 'utf8', env: { ...process.env, CODEX_HOME: codexHome, JEV_HOME: codexHome, JEV_PROVIDER: '' },
+    });
+    const profile = () => fs.readFileSync(path.join(codexHome, 'jevgpt.config.toml'), 'utf8');
+    assert.equal(run().status, 0);
+    assert.match(profile(), /requires_openai_auth = true/);
+    assert.equal(run('--provider', 'openrouter').status, 0);
+    assert.match(profile(), /env_key = "OPENROUTER_API_KEY"/);
+    assert.doesNotMatch(profile(), /requires_openai_auth/);
+    assert.equal(run('--provider=openai').status, 0);
+    assert.match(profile(), /env_key = "OPENAI_API_KEY"/);
+    const bad = run('--provider', 'azure');
+    assert.equal(bad.status, 1);
+    assert.match(bad.stderr, /JEV_PROVIDER must be chatgpt\|openai\|openrouter/);
+  } finally {
+    fs.rmSync(codexHome, { recursive: true, force: true });
   }
 });

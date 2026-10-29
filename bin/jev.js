@@ -8,6 +8,7 @@ import { loadConfig, EFFORTS } from '../src/config.js';
 import { createProxy } from '../src/proxy.js';
 import { formatDecision, readDecisions, usageTokens } from '../src/log.js';
 import { VERSION, BUILD, APP, isOurProxy, compareBuild } from '../src/version.js';
+import { loadEnvFiles, authLine } from '../src/envfile.js';
 
 const NAME = APP;
 // Codex profile name; `codex -p jevgpt` selects the provider written by `install`.
@@ -18,7 +19,9 @@ const HELP = `${NAME} — one GPT model (GPT-6.1 Terra), reasoning effort low..x
 Usage:
   ${NAME} serve              Run the proxy in the foreground (shows live decisions)
                                 (opencode/aider/crush: base URL http://127.0.0.1:8789/v1, model jev-auto)
-  ${NAME} install [--force]  Write the "${PROFILE}" Codex profile ($CODEX_HOME/${PROFILE}.config.toml)
+  ${NAME} install [--provider P] [--force]  Write the "${PROFILE}" Codex profile ($CODEX_HOME/${PROFILE}.config.toml);
+                                P = chatgpt (Codex login, default), openai (OPENAI_API_KEY) or
+                                openrouter (OPENROUTER_API_KEY) for the main model
   ${NAME} codex [args...]    Start the proxy if needed, then run: codex -p ${PROFILE} [args...]
   ${NAME} tail               Follow routing decisions as they happen
   ${NAME} stats              Summarize past decisions by effort, with reasoning tokens and resumed turns
@@ -26,7 +29,9 @@ Usage:
   ${NAME} stop               Stop the running proxy (also one started in the background)
   ${NAME} --version          Print the version and build of the code on disk
 
-Environment:
+Environment (also read from .env.local / .env in the project folder or JEV_HOME; see .env.example):
+  OPENROUTER_API_KEY  Jev decisions (and the main model with --provider openrouter)
+  OPENAI_API_KEY  the main model with --provider openai   JEV_PROVIDER (chatgpt|openai|openrouter)
   JEV_PORT (8789)  JEV_GPT_MODEL (gpt-6.1-terra)  JEV_LEVELS (low,medium,high,xhigh)  JEV_DEFAULT_EFFORT (medium)
   JEV_MODE (jev|heuristic|llm|off)  JEV_CONTINUE (on|off)  JEV_MAX_CONTINUES (3)  JEV_CONTINUE_THRESHOLD (0.6)
   JEV_NUDGE (on|off)  JEV_JUDGE_MODEL  JEV_UPSTREAM  JEV_HOME (~/.jev-gpt)  JEV_QUIET=1`;
@@ -45,7 +50,7 @@ model_reasoning_effort = "${config.defaultEffort}"
 name = "Jev GPT"
 base_url = "http://${config.host}:${config.port}/v1"
 wire_api = "responses"
-requires_openai_auth = true
+${authLine(config.provider)}
 `;
 }
 
@@ -261,8 +266,31 @@ function stats(config) {
   }
 }
 
+// --provider P (also --provider=P) sets JEV_PROVIDER for this run; other arguments are returned.
+function takeProvider(args, env = process.env) {
+  const rest = [];
+  for (let i = 0; i < args.length; i++) {
+    const [flag, inline] = args[i].split(/=(.*)/s);
+    if (flag !== '--provider') {
+      rest.push(args[i]);
+      continue;
+    }
+    const value = inline ?? args[++i];
+    if (!value || (inline == null && value.startsWith('-'))) throw new Error('--provider needs a value');
+    env.JEV_PROVIDER = value;
+  }
+  return rest;
+}
+
 async function main() {
-  const [cmd, ...rest] = process.argv.slice(2);
+  const [cmd, ...args] = process.argv.slice(2);
+  const rest = cmd === 'install' ? takeProvider(args) : args;
+  // Keys from .env.local / .env (project folder, then JEV_HOME); the shell's own variables win.
+  const envFiles = loadEnvFiles();
+  for (const { file, error } of envFiles) if (error) console.error(`${NAME}: warning: cannot read ${file}: ${error}`);
+  if (cmd === 'serve') {
+    for (const { file, keys, error } of envFiles) if (!error) console.log(`${NAME}: loaded ${keys.join(', ') || 'nothing new'} from ${file}`);
+  }
   const config = loadConfig();
   switch (cmd) {
     case 'serve': return serve(config);

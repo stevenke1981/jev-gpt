@@ -1,2 +1,5 @@
 node_modules/
 .jev-test/
+.env
+.env.local
+.env.*.local
